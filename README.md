@@ -2,7 +2,7 @@
 
 Run multiple coding agents (or just multiple feature branches) in parallel on the same monorepo — with full hot reload, no port collisions, and no Docker.
 
-Designed for the case where you want to give each Claude Code / Cursor / human session its own isolated dev environment that's instantly ready to play with.
+Designed for the case where you want to give each Claude Code / Cursor / human session its own isolated dev environment that's instantly ready to play with — and that an autonomous agent can start, query, and tear down without guessing.
 
 ## The problem
 
@@ -14,34 +14,73 @@ Containers solve isolation but kill the dev loop: filesystem watchers across vol
 
 Use **git worktrees** instead. Each worktree is a checkout of a different branch in its own folder, sharing the same `.git` underneath — free isolation on the filesystem with native fs and native hot reload.
 
-`dev.sh` handles the rest:
+`dev.sh` handles the rest, docker-compose style:
 
-- Hashes the worktree name into a deterministic port slot (0–19)
-- Backend runs on `9000 + slot`, web on `3000 + slot` — never collides between worktrees
+- Hashes the worktree name into a deterministic port slot (0–19): backend on `9000 + slot`, web on `3000 + slot`, Metro on `8081 + slot` — never collides between worktrees
+- `up` is an idempotent, health-gated **converge**: it attaches to services that are already healthy, restarts dead ones, and refuses (loudly) if a foreign process squats on a port
+- Services detach into their own sessions and log to `.dev/logs/<svc>.log` — they keep running after your terminal (or your agent's shell) exits
+- `status --json` gives machine-readable per-service state with meaningful exit codes, so agents can script against it
 - Auto-writes a host/port config file the mobile app reads at runtime, so the simulator always points at *this* worktree's backend
-- Boots `sbt`, `next dev`, and Metro per worktree (with one exception, see below)
+- Concurrent `up`/`stop` runs are serialized with locks (with stale-lock recovery), so two agents racing to start the stack can't corrupt it
 
-## The Metro constraint
+Zero dependencies beyond stock macOS.
 
-React Native bakes the Metro port (8081) into the native build at compile time, so running two Metros at once is an antipattern — the app you built only knows about one of them. So:
+## Commands
 
-- The first worktree to start `dev.sh` **owns** Metro and the simulator
-- Other worktrees detect 8081 is busy and skip Metro entirely (their backend + web still start, so the agent can keep working on those layers)
-- The script **refuses to build iOS from a non-owner worktree** — otherwise the simulator silently loads the wrong JS bundle and you spend an hour debugging code that isn't even running
+```
+./dev.sh up [ios|device|android] [sim-name]   # start/converge the stack (idempotent, health-gated)
+./dev.sh status [--json]    # per-service state; exit 0 healthy / 1 down / 2 partial / 3 conflict
+./dev.sh stop [--force]     # tear down this worktree's stack (--force: reap by port, ignores state)
+./dev.sh logs <svc> [-f]    # svc: backend | web | metro | mobile | build
+./dev.sh                    # up + follow combined logs (Ctrl+C detaches — does NOT stop the stack)
+./dev.sh ios [sim-name]     # shorthand for: up ios
+```
 
-To switch which worktree owns Metro, stop the current `dev.sh` and start the new one.
+Flags:
 
-## Default assumptions
+```
+--force / -f      with up: nuke mobile node_modules/Pods/DerivedData, reinstall, rebuild
+--timeout <sec>   with up: health-gate timeout (default 300)
+--own-sim         with up ios: build onto a per-worktree simulator clone (side-by-side worktrees)
+--json            with status: machine-readable output
+```
 
-This template assumes a monorepo with three top-level dirs and a default stack:
+`up` returns only when every service actually answers its health probe (the docker `--wait` contract) — including the backend's first compile. If a service dies while starting, `up` says so immediately with the last log lines instead of waiting out the timeout.
 
-| Dir         | Default stack       | What to adapt                                  |
-|-------------|---------------------|-----------------------------------------------|
-| `backend/`  | Scala + Play (sbt)  | `[backend]` block at the bottom of the script |
-| `web/`      | Next.js             | `[web]` block at the bottom                   |
-| `mobile/`   | React Native        | `DEV_PORTS_REL_PATH` config var at the top    |
+## Metro is per-worktree too
 
-If your subdir names differ, change `BACKEND_DIR` / `WEB_DIR` / `MOBILE_DIR` at the top of the script.
+React Native bakes the Metro port into the native build at compile time (`RCT_METRO_PORT`), which is exactly why each worktree gets its **own** Metro on `8081 + slot`: the app built from a worktree talks to that worktree's Metro, and can never silently load another branch's JS bundle.
+
+By default all worktrees build onto the same simulator (last build wins). With `--own-sim`, each worktree clones the base simulator once (`wt-<worktree-name>`) and builds onto its clone, so two agents can run their apps side by side.
+
+## Agent-friendliness
+
+The state model is what makes this usable by autonomous agents:
+
+- `./dev.sh status --json` reports each service's state (`stopped | starting | healthy | stale | conflict`), port, pid, URL, and log path, plus the simulator UDID and app bundle id when known — no `lsof`/`simctl` archaeology needed.
+- Exit codes are contractual: `0` healthy, `1` down, `2` partial, `3` port conflict.
+- State lives in `.dev/state.env` (bash-parseable key=value). The script never trusts it blindly — process identity is verified via start-time (defeats PID reuse) and port ownership via `lsof` before anything is reaped.
+- The app's own `console.log` output lands in `.dev/logs/mobile.log` (RN 0.76+ routes JS logs to DevTools, not Metro's stdout; a small helper subscribes to Metro's inspector to capture them — drop `metro-console-tail.js` into `mobile/scripts/` to enable it).
+- Native builds serialize on a separate lock from server startup, so one agent's long xcodebuild never blocks another agent's server-only `up`.
+
+## Configuration
+
+Everything project-specific lives in the `CONFIGURATION` block at the top of the script:
+
+| Variable              | Default                          | What it is                                        |
+|-----------------------|----------------------------------|---------------------------------------------------|
+| `BACKEND_DIR`         | `backend`                        | Backend subdir (template assumes Scala + Play)    |
+| `WEB_DIR`             | `web`                            | Web subdir (template assumes Next.js)             |
+| `MOBILE_DIR`          | `mobile`                         | Mobile subdir (template assumes React Native)     |
+| `BACKEND_HEALTH_PATH` | `/api/health`                    | Backend endpoint the health gate probes           |
+| `DEV_PORTS_REL_PATH`  | `src/config/devPorts.local.ts`   | Where the generated host/port config is written   |
+| `BACKEND_PORT_BASE`   | `9000`                           | Backend port = base + slot                        |
+| `WEB_PORT_BASE`       | `3000`                           | Web port = base + slot                            |
+| `METRO_PORT_BASE`     | `8081`                           | Metro port = base + slot                          |
+| `SLOT_COUNT`          | `20`                             | Number of port slots                              |
+| `DEFAULT_IOS_SIM`     | `iPhone 17 Pro`                  | Simulator when `$IOS_SIM` isn't set               |
+
+The dev-server commands themselves (sbt / next / react-native) live in `start_service()` — adapt them if your stack differs.
 
 ## Quick start
 
@@ -49,35 +88,24 @@ If your subdir names differ, change `BACKEND_DIR` / `WEB_DIR` / `MOBILE_DIR` at 
    ```
    chmod +x dev.sh
    ```
-2. Edit the `CONFIGURATION` block at the top of the script (subdir names, default simulator, mobile config path).
-3. Edit the `DEV SERVER COMMANDS` block at the bottom if your stack isn't Scala + Next.js + RN.
-4. Make sure the auto-generated `devPorts.local.ts` (or your equivalent) is gitignored.
+2. Edit the `CONFIGURATION` block at the top (subdir names, health path, port bases, simulator).
+3. Edit the commands in `start_service()` if your stack isn't Scala + Next.js + RN.
+4. Gitignore the generated files:
+   ```
+   .dev/
+   devPorts.local.ts
+   ```
 5. From any worktree:
    ```
-   ./dev.sh           # backend + web + Metro (if 8081 is free)
-   ./dev.sh ios       # also build & run iOS sim
+   ./dev.sh up        # backend + web + metro, health-gated
+   ./dev.sh up ios    # also build & run iOS sim
+   ./dev.sh status    # is it up?
+   ./dev.sh stop      # tear it down
    ```
-
-## Usage
-
-```
-./dev.sh                       # backend + web + Metro (if 8081 free)
-./dev.sh ios                   # + iOS simulator (uses $IOS_SIM or default)
-./dev.sh ios "iPhone 15 Pro"   # + specific simulator
-./dev.sh device                # + attached iOS device
-./dev.sh android               # + Android emulator/device
-./dev.sh ios --force           # nuke node_modules, Pods, DerivedData first
-```
-
-Filter logs from one stream:
-
-```
-./dev.sh 2>&1 | grep '^\[backend\]'
-```
 
 ## Mobile app integration
 
-Every run, the script writes `$MOBILE_DIR/$DEV_PORTS_REL_PATH` (default `mobile/src/config/devPorts.local.ts`):
+On every `up`, the script writes `$MOBILE_DIR/$DEV_PORTS_REL_PATH` (default `mobile/src/config/devPorts.local.ts`):
 
 ```ts
 // AUTO-GENERATED by dev.sh — do not edit by hand. Gitignored.
@@ -87,8 +115,6 @@ export const DEV_WEB_PORT = 3007;
 ```
 
 Your mobile app should read from this file at runtime to know where its backend lives. Recommended pattern: commit a `devPorts.ts` with safe defaults, and have your `constants.ts` (or equivalent) import from `devPorts.local` first, falling back to `devPorts` if `.local` is missing. A postinstall script can bootstrap the `.local` file on fresh checkouts.
-
-Add `devPorts.local.ts` to `.gitignore`.
 
 ## Why git worktrees instead of multiple clones
 
@@ -102,7 +128,7 @@ A worktree is a separate checkout of a branch sharing the same underlying `.git`
 ```
 git worktree add ../feature-x feature-x
 cd ../feature-x
-./dev.sh
+./dev.sh up
 ```
 
 ## How port slots work
@@ -111,18 +137,18 @@ cd ../feature-x
 slot     = cksum(worktree-name) % 20
 backend  = 9000 + slot
 web      = 3000 + slot
-metro    = 8081  (always, single-owner)
+metro    = 8081 + slot
 ```
 
-20 slots is arbitrary — bump it if you regularly run more than ~10 worktrees and start hitting hash collisions. Two worktrees that hash to the same slot can't run simultaneously; easiest fix is renaming one of them.
+20 slots is arbitrary — bump `SLOT_COUNT` if you regularly run more than ~10 worktrees and start hitting hash collisions. Two worktrees that hash to the same slot can't run simultaneously; easiest fix is renaming one of them.
 
 ## Caveats
 
-- **macOS only** for the iOS pieces. Linux/Windows users can still use the worktree + port-slot logic for backend + web.
-- **One simulator at a time.** Platform constraint, not a script limitation.
+- **macOS only** for the iOS pieces (and the script currently assumes macOS primitives — `lsof`, `stat -f`, `mkdir` locks). Linux users can adapt the worktree + port-slot logic for backend + web.
 - **`mobile/node_modules` is duplicated per worktree** (~1GB each). Required because CocoaPods generates broken header symlinks if `node_modules` is itself a symlink. `web/node_modules` is symlinked from the main checkout (Next.js handles this fine).
 - **`pod install` runs once per worktree** the first time you build iOS, takes 1–2 min. CocoaPods bakes worktree-absolute paths into its xcconfig, so it can't be shared.
-- **DerivedData per workspace path.** A `--force` clean only nukes this worktree's caches, not anyone else's.
+- **DerivedData per workspace path.** A `--force` clean only nukes this worktree's caches (including its Watchman watch root), not anyone else's.
+- **Shared simulator by default.** Without `--own-sim`, two worktrees building iOS target the same simulator and the last build wins. `--own-sim` costs a one-time simulator clone (~30s) per worktree.
 
 ## License
 
